@@ -1,0 +1,130 @@
+from airflow.sdk import DAG,task
+from airflow.providers.telegram.hooks.telegram import TelegramHook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.hooks.trigger_dagrun import TriggerDagRunHook
+
+def on_failure_callback(context):
+
+    dag_id = context['dag'].dag_id
+    task_id = context['ti'].task_id
+    error = context['exception']
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"DAG: {dag_id}, TASK: {task_id}, ERROR: {error}")
+
+def on_success_callback(context):
+
+    dag_id = context['dag'].dag_id
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"ВСЕ ПРОШЛО УСПЕШНО. ПОЗДРАВЛЯЮ!, DAG: {dag_id}")
+
+def on_execute_callback(context):
+
+    dag_id = context['dag'].dag_id
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"ДАГ НАЧАЛ СВОЮ РАБОТУ!, DAG: {dag_id}")
+
+
+def on_skipped_callback(context):
+    
+    dag_id = context['dag'].dag_id
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"НОВЫХ СОБЫТИЙ ЗА ПОСЛЕДНИЕ 15 МИНУТ НЕ БЫЛО!, DAG: {dag_id}")
+    
+default_args={'on_success_callback': on_success_callback
+              ,'on_failure_callback': on_failure_callback
+              ,'on_execute_callback': on_execute_callback
+              ,'on_skipped_callback': on_skipped_callback}
+
+with DAG(
+    'extract_from_mongo_dag',
+    schedule=None,
+    default_args,
+    max_active_runs=1,
+    catchup = False,
+    tags=['mongo_TIRED']
+
+) as dag:
+
+    @task(multiple_outputs=True)
+    def extract_raw_evets_from_mongo():
+    
+     
+        from airflow.providers.mongo.hooks.mongo import MongoHook
+        from airflow.providers.redis.hooks.redis import RedisHook
+    
+        import json as js
+        import numpy as np
+    
+        with RedisHook(redis_conn_id='redis_default').get_conn() as r_hook:
+            last_time_stamp = r_hook.get('last_time_stamp')
+            if last_time_stamp is None:
+                r_hook.set('last_time_stamp', '1970-01-01 00:00:00')
+                last_time_stamp = '1970-01-01 00:00:00'
+
+            last_time_stamp = last_time_stamp.decode('utf8') if not isinstance(last_time_stamp,str) else last_time_stamp            
+            last_time_stamp = datetime.strptime(last_time_stamp,'%Y-%m-%d %H:%M:%S')      # здесь не нужно декодировать last_time_stamp
+                                                                                            # Это cделано на стороне redis в параметре
+                                                                                            # "decode_responses":true
+            
+            with MongoHook(mongo_conn_id='mongo_default').get_conn() as m_hook:
+               
+                event = m_hook['event']
+                events = event['events']
+
+                events = list(events.find({'timestamp': {'$gt': last_time_stamp} },{'_id': 0}))
+
+        if not events:
+            return None
+            
+        dt = pd.DataFrame(data=events
+                          ,columns=['event_id','user_id','session_id','event_type','product_id','timestamp','quantity','price_at_event']
+                          )
+
+        dt = dt.astype({
+        'event_id': 'Int64',      # С большой буквы! Теперь NaN разрешен.
+        'user_id': 'Int64',       # С большой буквы!
+        'session_id': 'string[pyarrow]',
+        'event_type': 'category',
+        'product_id': 'Int64',      # С большой буквы!
+        'timestamp': 'datetime64[ns]',  
+        'quantity': 'Int32',      # С большой буквы!
+        'price_at_event': 'float32'
+        })
+
+
+        max_ts = dt['timestamp'].max()
+        max_ts = datetime.strftime(max_ts,'%Y-%m-%d %H:%M:%S') if not max_ts is np.nan else datetime.strftime(last_time_stamp, '%Y-%m-%d %H:%M:%S')
+    
+        local_path=r'/tmp/raw_events.parquet'
+
+        date_of_create_raw_events_parquet = datetime.now().strftime('%Y-%m-%d')
+
+        key_path = f"events/date={date_of_create_raw_events_parquet}/raw_events.parquet"
+    
+        dt.to_parquet(path=local_path,engine='pyarrow',compression='lz4',index=False)
+
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+
+        s3_hook.load_file(filename=local_path,key=key_path,bucket_name='fullpetpipeline',replace=True)
+
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+        conf = {
+        "max_ts": max_ts,
+        "date_of_create_raw_events_parquet": date_of_create_raw_events_parquet
+        }
+
+        trigger_hook = TriggerDagRunHook()
+
+        trigger_hook.trigger_dag(dag_id='transform_data_dag',
+                                logical_date = None,  # В Airflow 2.x называется execution_date
+                                run_id = None,
+                                conf = conf,
+                                wait_for_completion = False,
+                                poke_interval = 60
+                                )
