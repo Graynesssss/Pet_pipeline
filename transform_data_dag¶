@@ -1,0 +1,523 @@
+from airflow.sdk import DAG,task
+from airflow.sdk import Variable # ПРАВИЛЬНЫЙ ИМПОРТ ДЛЯ AIRFLOW 3.x
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.telegram.hooks.telegram import TelegramHook
+from airflow.hooks.trigger_dagrun import TriggerDagRunHook
+#from airflow.providers.amazon.aws.sensors.s3 import S3KeySizeSensor
+
+import os
+import shutil
+from datetime import datetime
+import pandas as pd
+
+def on_failure_callback(context):
+
+    dag_id = context['dag'].dag_id
+    task_id = context['ti'].task_id
+    error = context['exception']
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"DAG: {dag_id}, TASK: {task_id}, ERROR: {error}")
+
+def on_success_callback(context):
+
+    dag_id = context['dag'].dag_id
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"ВСЕ ПРОШЛО УСПЕШНО. ПОЗДРАВЛЯЮ!, DAG: {dag_id}")
+
+def on_execute_callback(context):
+
+    dag_id = context['dag'].dag_id
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"ДАГ НАЧАЛ СВОЮ РАБОТУ!, DAG: {dag_id}")
+
+
+def on_skipped_callback(context):
+    
+    dag_id = context['dag'].dag_id
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"НОВЫХ СОБЫТИЙ ЗА ПОСЛЕДНИЕ 15 МИНУТ НЕ БЫЛО!, DAG: {dag_id}")
+    
+default_args={'on_success_callback': on_success_callback
+              ,'on_failure_callback': on_failure_callback
+              ,'on_execute_callback': on_execute_callback
+              ,'on_skipped_callback': on_skipped_callback}
+
+# max_source_ts_ms_products = 0 # Время когда произошло какое-то событие(r,c,d,u)
+# max_source_ts_ms_categories = 0 # Время когда произошло какое-то событие(r,c,d,u)
+
+with DAG(
+    'transform_data_dag',
+    schedule=None,
+    default_args,
+    max_active_runs=1,
+    catchup = False,
+    tags=['taransform_TIRED']
+
+) as dag:
+
+    import json
+
+    @task
+    def check_create_table_dag():
+
+        status = json.loads( Variable.get('create_table_dag_status') )
+
+        if not status:
+
+            trigger_hook = TriggerDagRunHook()
+            
+            trigger_hook.trigger_dag(dag_id='create_table_dag',
+                                    logical_date = None,  # В Airflow 2.x называется execution_date
+                                    run_id = None,
+                                    wait_for_completion = True,
+                                    poke_interval = 15
+                                    )
+            
+            Variable.set('create_table_dag_status', 'true')
+
+            source_path="/opt/airflow/dags/create_table_dag.py",
+            archive_dir="/opt/airflow/archive_dags/" 
+
+            if not os.path.exists(archive_dir):
+                os.makedirs(archive_dir)
+                print(f"Создана папка для архива: {archive_dir}")
+    
+            # Проверяем, на месте ли исходный файл DAG
+            if os.path.exists(source_path):
+                filename = os.path.basename(source_path) # извлекает create_table_dag.py из source_path
+                destination_path = os.path.join(archive_dir, filename)
+                
+                print(f"Перемещаем файл из {source_path} в {destination_path}...")
+                
+                # Перемещаем файл
+                shutil.move(source_path, destination_path)
+                print("Файл успешно перемещен. Через полминуты DAG исчезнет из UI Airflow.")
+            else:
+                print(f"Ошибка: Файл {source_path} не найден на этом воркере.")
+    
+
+    @task
+    def change_s3_file_products(path_to_products):
+
+        import json 
+
+        local_path_products=r'/tmp/'
+
+        key_path_products = path_to_products
+
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+
+        s3_hook.download_file(local_path=local_path_products,key=key_path_products,bucket_name='fullpetpipeline')
+
+        dt_products = pd.read_parquet(path=local_path_products,engine='pyarrow')
+        
+
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+
+        max_source_ts_ms_products = json.loads( Variable.get('max_source_ts_ms_products') )
+
+    
+        result_products = client.execute("""SELECT op
+                                                ,ts_ms
+                                                , ifNull(`before.id`, 0)
+                                                , ifNull(`before.name`, '')
+                                                , ifNull(`before.price`, 0.0)
+                                                , ifNull(`before.category_id`, 0)
+                                                , ifNull(`before.updated_at`, toDateTime(0))
+                                                , ifNull(`after.id`, 0)
+                                                , ifNull(`after.name`, '')
+                                                , ifNull(`after.price`, 0)
+                                                , ifNull(`after.category_id`, 0)
+                                                , ifNull(`after.updated_at`, toDateTime(0))
+                                            FROM full_pet_pipeline.categories
+                                            where tupleElement(source,'ts_ms') > %(max_source_ts_ms_products)s"""
+                                           ,{'max_source_ts_ms_products': max_source_ts_ms_products}
+                                        )
+                
+                
+
+        for tup in result_products:
+            
+            if tup[0] == 'c':
+
+                after = tup[3:]
+
+                dt_products = pd.concat([dt_products,after],axis=0,ignore_index=True)
+                    
+            elif tup[0] == 'u':
+                
+                product_id = tup[2]
+
+                after = tup[5:],
+
+                after = pd.DataFrame(after,columns=['id','name','price','category_id','updated_at'])
+                
+                dt_products[ dt_products['id'] == product_id ] = after             
+                    
+            elif tup[0] == 'd':
+
+                product_id = tup[2]
+
+                dt_products = dt_products[ dt_products['id'] != product_id ]
+
+        s3_hook.load_file(filename=local_path_products,key=key_path_products,bucket_name='fullpetpipeline',replace=True)
+
+        if os.path.exists(local_path_products):
+            os.remove(local_path_products)
+
+        
+
+    @task
+    def change_s3_file_categories(path_to_categories):
+
+        import json 
+
+        local_path_categories=r'/tmp/'
+
+        key_path_categories = path_to_categories
+
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+
+        s3_hook.download_file(local_path=local_path_categories,key=key_path_categories,bucket_name='fullpetpipeline')
+
+        dt_categories = pd.read_parquet(path=local_path_categories,engine='pyarrow')
+        
+
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+
+        max_source_ts_ms_categories = json.loads( Variable.get('max_source_ts_ms_categories') )
+
+        result_categories = client.execute("""SELECT op
+                                                    ,ts_ms
+                                                    , ifNull(`before.id`, 0)
+                                                    , ifNull(`before.name`, '')
+                                                    , ifNull(`before.parent_id`, 0)
+                                                    , ifNull(`before.updated_at`, toDateTime(0))
+                                                    , ifNull(`after.id`, 0)
+                                                    , ifNull(`after.name`, '')
+                                                    , ifNull(`after.parent_id`, 0)
+                                                    , ifNull(`after.updated_at`, toDateTime(0)) 
+                                             FROM full_pet_pipeline.categories
+                                             where tupleElement(source,'ts_ms') > %(max_source_ts_ms_categories)s"""
+                                           ,{'max_source_ts_ms_categories': max_source_ts_ms_categories}
+                                        )
+
+        for tup in result_categories:
+            
+            if tup[0] == 'c':
+
+                after = tup[3:]
+
+                dt_categories = pd.concat([dt_categories,after],axis=0,ignore_index=True)
+                    
+            elif tup[0] == 'u':
+                
+                category_id = tup[2]
+
+                after = tup[5:],
+
+                after = pd.DataFrame(after,columns=['id','name','parent_id'])
+                
+                dt_categories[ dt_categories['id'] == category_id ] = after       
+                    
+            elif tup[0] == 'd':
+
+                category_id = tup[2]
+
+                dt_categories = dt_categories[ dt_categories['id'] != category_id ]
+
+        s3_hook.load_file(filename=local_path_categories,key=key_path_categories,bucket_name='fullpetpipeline',replace=True)
+
+        if os.path.exists(local_path_categories):
+            os.remove(local_path_categories)
+
+
+    @task.branch
+    def choice_extract_from_postgres_or_change_s3_file_products_or_categories():
+
+        import json
+
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()   
+        
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+
+        if not s3_hook.check_for_key(f"events/products.parquet",'fullpetpipeline') and not s3_hook.check_for_key(f"events/categories.parquet",'fullpetpipeline'):
+            return 'extract_from_postgres'
+        
+        max_source_ts_ms_categories = json.loads( Variable.get('max_source_ts_ms_categories') )
+        max_source_ts_ms_products = json.loads( Variable.get('max_source_ts_ms_products') )
+        
+
+        result_products = client.execute("""SELECT tupleElement(source,'ts_ms') as source_ts_ms
+                                        FROM full_pet_pipeline.create_table_captured_changes_products_for_mat_view
+                                        where tupleElement(source,'ts_ms') > %(max_source_ts_ms_products)s
+                                        """,{'max_source_ts_ms_products': max_source_ts_ms_products}
+                                        )
+
+        result_categories = client.execute("""SELECT tupleElement(source,'ts_ms') as source_ts_ms                                      
+                                        FROM full_pet_pipeline.create_table_captured_changes_categories_for_mat_view
+                                        where tupleElement(source,'ts_ms') > %(max_source_ts_ms_categories)s
+                                        """,{'max_source_ts_ms_categories': max_source_ts_ms_categories}
+                                        )
+
+        if not result_products and not result_categories:
+            return 'skip_products_and_categories'
+
+        elif result_products and result_categories:
+            Variable.set('max_source_ts_ms_products',result_products[0][0])
+            Variable.set('max_source_ts_ms_categories',result_categories[0][0])
+            
+            return ['change_s3_file_products', 'change_s3_file_categories']
+
+        elif result_products:
+            Variable.set('max_source_ts_ms_products',result_products[0][0])
+            return 'change_s3_file_products'
+
+        elif result_categories:
+            Variable.set('max_source_ts_ms_categories',result_categories[0][0])
+            return 'change_s3_file_categories'        
+               
+
+    @task(multiple_outputs=True)
+    def extract_from_postgres():
+        import os  # НЕ ЗАБУДЬТЕ ИМПОРТЫ
+        import pandas as pd
+        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+        with PostgresHook(postgres_conn_id='postgres_default').get_conn() as p_hook:    
+            cur = p_hook.cursor()
+            
+            cur.execute("SELECT id, name, price, category_id, updated_at FROM products") 
+            products = cur.fetchall()
+
+            cur.execute("SELECT id, name, parent_id, updated_at FROM categories") 
+            categories = cur.fetchall()
+
+        # ДЛЯ LINUX (Airflow в Docker) путей на C:\ нет! Используйте /tmp/
+        local_path_products = '/tmp/products.parquet'
+        local_path_categories = '/tmp/categories.parquet'
+
+        key_path_products = "events/products.parquet"
+        key_path_categories = "events/categories.parquet"
+            
+        dt_products = pd.DataFrame(data=products, columns=['id', 'name', 'price', 'category_id', 'updated_at'])
+        dt_categories = pd.DataFrame(data=categories, columns=['id', 'name', 'parent_id', 'updated_at'])
+
+        dt_products.to_parquet(path=local_path_products, engine='pyarrow', compression='lz4')
+        dt_categories.to_parquet(path=local_path_categories, engine='pyarrow', compression='lz4')
+
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+
+        # ИСПРАВЛЕНО: Заменили path на filename и bucket на bucket_name
+        s3_hook.load_file(filename=local_path_products, key=key_path_products, bucket_name='fullpetpipeline', replace=True)
+        s3_hook.load_file(filename=local_path_categories, key=key_path_categories, bucket_name='fullpetpipeline', replace=True)
+
+        # ИСПРАВЛЕНО: У os нет метода exists. Правильно: os.path.exists
+        if os.path.exists(local_path_products):
+            os.remove(local_path_products)
+
+        if os.path.exists(local_path_categories):
+            os.remove(local_path_categories)
+
+        # ИСПРАВЛЕНО: Для multiple_outputs=True нужно возвращать словарь (dict), а не tuple!
+        return {
+            "key_path_products": key_path_products,
+            "key_path_categories": key_path_categories
+        }
+
+        
+    @task
+    def refresh_last_timestamp_and_product_cache(path_to_products,path_to_categories):
+
+        context = get_current_context()
+
+        max_ts = context['dag_run'].conf.max_ts
+
+        local_path_products = r'/tmp/products.parquet'
+
+        local_path_categories = r'/tmp/categories.parquet'
+    
+        from airflow.providers.redis.hooks.redis import RedisHook
+    
+        with RedisHook(redis_conn_id='redis_default').get_conn() as r_hook:
+
+            s3_hook = S3Hook(aws_conn_id='s3_default')
+
+            s3_hook.download_file(key=path_to_products,bucket_name='fullpetpipeline',local_path=local_path_products)
+            s3_hook.download_file(key=path_to_categories,bucket_name='fullpetpipeline',local_path=local_path_categories)
+
+            dt_products = pd.read_parquet(path=local_path_products,engine='pyarrow')
+
+            dt_categories = pd.read_parquet(path=local_path_categories,engine='pyarrow')
+
+            dt_dim_products = pd.merge(dt_products[['id','name','price','category_id']],dt_categories.rename(columns={'id': 'c_id'})[['c_id','name']],how='left',left_on='category_id',right_on='c_id',suffixes=('product_','category_'))
+
+            dt_dim_products = dt_dim_products.drop(columns=['category_id','c_id'])
+            
+            last_time_stamp = max_ts
+        
+            r_hook.set('last_time_stamp',last_time_stamp)
+            
+            r_hook.set('product_cache',dt_dim_products.to_json(orient='records'))
+
+            if os.path.exists(local_path_products):
+                os.remove(local_path_products)
+                
+            if os.path.exists(local_path_categories):
+                os.remove(local_path_categories)
+                
+            return last_time_stamp
+    
+    @task
+    def extract_raw_events_from_clickhouse_for_transform(last_time_stamp):
+
+        import json as js
+
+        from airflow.providers.redis.hooks.redis import RedisHook
+    
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+
+        last_time_stamp = datetime.strptime(last_time_stamp, '%Y-%m-%d %H:%M:%S')
+    
+        client.execute(f"SELECT * from raw_events where timestamp > %(ts)s",{'ts': last_time_stamp})
+    
+        data = client.fetchall()
+    
+        events_dt = pd.DataFrame(data=data
+                          ,columns=['event_id','user_id','session_id','event_type','product_id','timestamp','quantity','price_at_event']
+                          )
+
+        events_dt = events_dt.astype({
+                    'event_id': 'int64',
+                    'user_id': 'int64',
+                    'session_id': 'string[pyarrow]',
+                    'event_type': 'category',
+                    'product_id': 'int64',
+                    'timestamp': 'datetime64[ns]',  # Важно: для pandas указываем точность наносекунд [ns]
+                    'quantity': 'int32',
+                    'price_at_event': 'float32'
+                })
+    
+        with RedisHook(redis_conn_id='redis_default').get_conn() as r_hook:
+    
+            product_jsons = r_hook.get('product_cache')
+            product_dict = js.loads(product_jsons)
+    
+        product_dt = pd.DataFrame(data=product_dict,columns=['product_id','product_name','price','updated_at','category_name'])
+        
+        events_dt = events_dt.drop_duplicates()
+    
+        fact_sales = pd.merge(events_dt,product_dt[['product_id','product_name','category_name']],how='left',on='product_id')
+
+        fact_sales['total'] = fact_sales['quantity'] * fact_sales['price_at_event']
+
+        fact_sales['is_purchase'] = (fact_sales['event_type'] == 'purchase').astype('int8')
+
+        local_path=r'/tmp/fact_sales.parquet'
+
+        date_of_create_fact_sales_parquet = datetime.now().strftime('%Y-%m-%d')
+
+        key_path_to_fact_sales = f"events/date={date_of_create_fact_sales_parquet}/fact_sales.parquet"          
+    
+        fact_sales.to_parquet(path=local_path,engine='pyarrow',compression='lz4')
+
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+
+        s3_hook.load_file(filename=local_path,key=key_path_to_fact_sales,bucket_name='fullpetpipeline',replace=True)
+
+        if os.path.exists(local_path):
+            os.remove(local_path)
+    
+        return date_of_create_fact_sales_parquet
+
+    @task
+    def upload_raw_events_to_clickhouse_in_raw_events():      
+    
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+
+        context = get_current_context()
+
+        date_of_create_raw_events_parquet = context['dag_run'].conf.date_of_create_raw_events_parquet
+    
+        client.execute( """INSERT INTO full_pet_pipeline.raw_events 
+                           SELECT event_id
+                                , user_id
+                                , session_id
+                                , event_type
+                                , product_id
+                                , timestamp
+                                , quantity
+                                , price_at_event 
+                         FROM s3_raw_events
+                         WHERE _path = http://airflow-docker-minio-1:9000/fullpetpipeline/events/date=%(date_of_create_raw_events_parquet)s/fact_sales.parquet
+                         """,{"date_of_create_raw_events_parquet": date_of_create_raw_events_parquet})
+
+    @task
+    def upload_categories_to_clickhouse():
+    
+        
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+        
+        client.execute(f"INSERT INTO full_pet_pipeline.categories SELECT *,1 FROM s3_categories")
+        
+
+    @task
+    def upload_products_to_clickhouse():
+    
+        
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+        
+        client.execute(f"INSERT INTO full_pet_pipeline.products SELECT *,1 FROM s3_products")
+
+    
+    @task
+    def upload_transform_data_to_clickhouse_in_fact_sales(date_of_create_fact_sales_parquet):
+           
+    
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+        
+        client.execute("""INSERT INTO full_pet_pipeline.fact_sales 
+                        SELECT * FROM s3_fact_sales
+                        WHERE _path = http://airflow-docker-minio-1:9000/fullpetpipeline/events/date=%(date_of_create_fact_sales_parquet)s/fact_sales.parquet
+                         """,{"date_of_create_fact_sales_parquet": date_of_create_fact_sales_parquet})
+
+check_create_table_dag = check_create_table_dag()
+choice_extract_from_postgres_or_change_s3_file_products_or_categories = choice_extract_from_postgres_or_change_s3_file_products_or_categories()
+postgres = extract_from_postgres()
+refresh_last_timestamp_and_product_cache = refresh_last_timestamp_and_product_cache()
+upload_raw_events_to_clickhouse_in_raw_events = upload_raw_events_to_clickhouse_in_raw_events()
+
+date_of_create_fact_sales_parquet = extract_raw_events_from_clickhouse_for_transform()
+path_to_products,path_to_categories = postgres['key_path_products'],postgres['key_path_categories']
+
+refresh_last_timestamp_and_product_cache(path_to_products,path_to_categories)
+upload_transform_data_to_clickhouse_in_fact_sales(date_of_create_fact_sales_parquet=date_of_create_fact_sales_parquet)
+extract_raw_events_from_clickhouse_for_transform = extract_raw_events_from_clickhouse_for_transform(last_time_stamp)
+
+check_create_table_dag >> [choice_extract_from_postgres_or_change_s3_file_products_or_categories
+                           ,extract_from_postgres
+                           ,upload_raw_events_to_clickhouse_in_raw_event]
+
+choice_extract_from_postgres_or_change_s3_file_products_or_categories >> [postgres
+                                                                          ,change_s3_file_products
+                                                                          ,change_s3_file_categories]
+
+
+postgres >> [upload_categories_to_clickhouse, upload_products_to_clickhouse]
+
+upload_raw_events_to_clickhouse_in_raw_events >> extract_raw_events_from_clickhouse_for_transform
