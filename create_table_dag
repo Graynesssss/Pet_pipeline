@@ -1,0 +1,526 @@
+from airflow.sdk import DAG,task
+from airflow.providers.telegram.hooks.telegram import TelegramHook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow_clickhouse_plugin.operators.clickhouse import ClickHouseOperator
+from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+
+def on_failure_callback(context):
+
+    dag_id = context['dag'].dag_id
+    task_id = context['ti'].task_id
+    error = context['exception']
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"DAG: {dag_id}, TASK: {task_id}, ERROR: {error}")
+
+def on_success_callback(context):
+
+    dag_id = context['dag'].dag_id
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"ВСЕ ПРОШЛО УСПЕШНО. ПОЗДРАВЛЯЮ!, DAG: {dag_id}")
+
+def on_execute_callback(context):
+
+    dag_id = context['dag'].dag_id
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"ДАГ НАЧАЛ СВОЮ РАБОТУ!, DAG: {dag_id}")
+
+
+def on_skipped_callback(context):
+    
+    dag_id = context['dag'].dag_id
+
+    tg_hook = TelegramHook(telegram_conn_id='telegram_default')
+    tg_hook.send_message(f"НОВЫХ СОБЫТИЙ ЗА ПОСЛЕДНИЕ 15 МИНУТ НЕ БЫЛО!, DAG: {dag_id}")
+    
+default_args={'on_success_callback': on_success_callback
+              ,'on_failure_callback': on_failure_callback
+              ,'on_execute_callback': on_execute_callback
+              ,'on_skipped_callback': on_skipped_callback}
+
+with DAG(
+    'create_table_dag',
+    schedule=None,
+    max_active_runs=1,
+    catchup = False,
+    tags=['create_table_TIRED']
+
+) as dag:
+
+    
+    @task
+    def create_s3_raw_events():
+
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+        creds = s3_hook.get_credentials()
+        
+        sql_query=f"""CREATE TABLE IF NOT EXISTS full_pet_pipeline.s3_raw_events
+                     ENGINE=S3('http://airflow-docker-minio-1:9000/fullpetpipeline/events/date=*/raw_events.parquet'
+                                #  , getSetting('SQL_aws_access_key_id')
+                                #  , getSetting('SQL_aws_secret_access_key')
+                                 ,{creds.access_key}
+                                 ,{creds.secret_key}
+                                 , 'Parquet'
+                                 )
+                     """
+
+        #settings = {'SQL_aws_access_key_id': creds.access_key, 'SQL_aws_secret_access_key': creds.secret_key}
+
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+
+        client.execute(sql_query)#,settings=settings)
+
+        
+        
+    @task  
+    def create_s3_categories():
+
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+        creds = s3_hook.get_credentials()
+
+        sql_query_categories=f"""CREATE TABLE IF NOT EXISTS full_pet_pipeline.s3_categories
+                     ENGINE=S3('http://airflow-docker-minio-1:9000/fullpetpipeline/events/categories.parquet'
+                                #  , getSetting('SQL_aws_access_key_id')
+                                #  , getSetting('SQL_aws_secret_access_key')
+                                 ,{creds.access_key}
+                                 ,{creds.secret_key}
+                                 , 'Parquet')
+                     """
+
+        #settings = {'SQL_aws_access_key_id': creds.access_key, 'SQL_aws_secret_access_key': creds.secret_key}
+
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+
+        client.execute(sql_query_categories)#,settings=settings)
+
+    @task  
+    def create_s3_products():
+
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+        creds = s3_hook.get_credentials()
+
+        sql_query_products=f"""CREATE TABLE IF NOT EXISTS full_pet_pipeline.s3_products
+                     ENGINE=S3('http://airflow-docker-minio-1:9000/fullpetpipeline/events/products.parquet'
+                                #  , getSetting('SQL_aws_access_key_id')
+                                #  , getSetting('SQL_aws_secret_access_key')
+                                 ,{creds.access_key}
+                                 ,{creds.secret_key}
+                                 , 'Parquet'
+                                 )
+                     """
+
+        #settings = {'SQL_aws_access_key_id': creds.access_key, 'SQL_aws_secret_access_key': creds.secret_key}
+
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+
+        client.execute(sql_query_products)#,settings=settings)
+
+    @task   
+    def create_s3_fact_sales():
+
+        s3_hook = S3Hook(aws_conn_id='s3_default')
+        creds = s3_hook.get_credentials()
+
+        sql_query=f"""CREATE TABLE IF NOT EXISTS full_pet_pipeline.s3_fact_sales
+                     ENGINE=S3('http://airflow-docker-minio-1:9000/fullpetpipeline/events/date=*/fact_sales.parquet'
+                                #  , getSetting('SQL_aws_access_key_id')
+                                #  , getSetting('SQL_aws_secret_access_key')
+                                 ,{creds.access_key}
+                                 ,{creds.secret_key}
+                                 ,'Parquet'
+                                 )
+                     """
+
+        #settings = {'SQL_aws_access_key_id': creds.access_key, 'SQL_aws_secret_access_key': creds.secret_key}
+
+        click_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_default')
+        client = click_hook.get_conn()
+
+        client.execute(sql_query)#,settings=settings)
+
+
+    create_raw_events = ClickHouseOperator(
+    task_id='create_raw_events',
+    sql="""CREATE TABLE IF NOT EXISTS full_pet_pipeline.raw_events 
+           (user_id UInt32
+           ,event_id UInt32
+           ,session_id UUID
+           ,event_type LowCardinality(String)
+           ,product_id UInt32
+           ,timestamp DateTime
+           ,quantity UInt32
+           ,price_at_event Float32
+           ) ENGINE=MergeTree()
+           PARTITION BY toYYYYMM(timestamp)
+           ORDER BY (event_type, timestamp)
+           settings index_granularity = 1;""",
+    clickhouse_conn_id='clickhouse_default'
+)
+    
+    create_products = ClickHouseOperator(
+        task_id='create_products',
+        sql="""CREATE TABLE IF NOT EXISTS full_pet_pipeline.products 
+               (id UInt32
+               ,name String
+               ,price Float32
+               ,category_id LowCardinality(String)
+               ,updated_at DateTime
+               ,is_active UInt8
+               ) ENGINE=ReplacingMergeTree(updated_at)
+               ORDER BY (id);""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_categories = ClickHouseOperator(
+        task_id='create_categories',
+        sql="""CREATE TABLE IF NOT EXISTS full_pet_pipeline.categories
+               (id UInt32
+               ,name String
+               ,parent_id UInt32
+               ,updated_at DateTime
+               ,is_active UInt8
+               ) ENGINE=ReplacingMergeTree(updated_at)
+               ORDER BY (id);""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+    
+    create_fact_sales = ClickHouseOperator(
+        task_id='create_fact_sales',
+        sql="""CREATE TABLE IF NOT EXISTS full_pet_pipeline.fact_sales 
+               (event_id UInt32
+               ,user_id UInt32
+               ,session_id UUID
+               ,event_type LowCardinality(String)
+               ,product_id UInt32
+               ,timestamp DateTime
+               ,quantity UInt32
+               ,product_name String
+               ,category_name LowCardinality(String)
+               ,total Float32
+               ,is_purchase UInt8
+               ) ENGINE=MergeTree()
+               PARTITION BY toYYYYMM(timestamp)
+               ORDER BY (event_type, timestamp)
+               settings index_granularity = 1;""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_table_my_daily_sales_for_mat_view = ClickHouseOperator(
+        task_id='create_table_my_daily_sales_for_mat_view',
+        sql="""CREATE TABLE IF NOT EXISTS full_pet_pipeline.my_daily_sales                                                                                                        
+               (date Date
+               ,category_name LowCardinality(String)
+               ,revenue AggregateFunction(sum, Float32)
+               ,avg_revenue AggregateFunction(avg, Float32)
+               )
+               ENGINE=AggregatingMergeTree()
+               PARTITION BY toYYYYMM(date)
+               ORDER BY (date, category_name);""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_mat_view_for_fact_sales = ClickHouseOperator(
+        task_id='create_mat_view_for_fact_sales',
+        sql="""CREATE MATERIALIZED VIEW IF NOT EXISTS full_pet_pipeline.mv_my_daily_sales 
+               TO my_daily_sales
+               AS SELECT
+                   toDate(timestamp) AS date,
+                   category_name,
+                   sumState(total) AS revenue,
+                   avgState(total) AS avg_revenue
+               FROM fact_sales
+               WHERE is_purchase = 1
+               GROUP BY date, category_name;""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_clickhouse_consumer_products = ClickHouseOperator(
+        task_id='create_clickhouse_consumer_products',
+        sql="""CREATE TABLE IF NOT EXISTS full_pet_pipeline.clickhouse_consumer_products
+        (
+            -- before: union(null, record Value)
+            before Nullable(
+                Tuple(
+                    id UInt32,
+                    name String,
+                    price Float32,
+                    category_id LowCardinality(String),
+                    updated_at DateTime
+                )
+            ),
+        
+            -- after: union(null, Value)
+            after Nullable(
+                Tuple(
+                    id UInt32,
+                    name String,
+                    price Float32,
+                    category_id LowCardinality(String),
+                    updated_at DateTime
+                )
+            ),
+        
+            -- source: record Source
+            source Tuple(
+                        version      String,
+                        connector    String,
+                        name         String,
+                        ts_ms        Int64,
+                        snapshot     Nullable(String),
+                        db           String,
+                        sequence     Nullable(String),
+                        ts_us        Nullable(Int64),
+                        ts_ns        Nullable(Int64),
+                        schema       String,
+                        "table"      String,
+                        txId         Nullable(Int64),
+                        lsn          Nullable(Int64),
+                        xmin         Nullable(Int64),
+                        origin       Nullable(String),
+                        origin_lsn   Nullable(Int64)
+                    ),
+        
+            op    String,
+            ts_ms Nullable(Int64)
+        )
+        ENGINE = Kafka
+        SETTINGS
+            kafka_broker_list = 'kafka:9092',
+            kafka_topic_list = 'petpipeline.public.products',
+            kafka_group_name = 'clickhouse_debezium_consumer_products_group_for_petpipeline',
+            kafka_format = 'AvroConfluent',
+            format_avro_schema_registry_url = 'http://schema-registry:8081',
+            kafka_max_block_size = 100000,
+            stream_flush_interval_ms = 5000,
+            kafka_num_consumers = 1,
+            kafka_commit_every_batch = 1;""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_clickhouse_consumer_categories = ClickHouseOperator(
+        task_id='create_clickhouse_consumer_categories',
+        sql="""CREATE TABLE IF NOT EXISTS full_pet_pipeline.clickhouse_consumer_categories
+        (
+            -- before: union(null, record Value)
+            before Nullable(
+                Tuple(
+                    id UInt32,
+                    name String,
+                    parent_id UInt32,
+                    updated_at DateTime,
+                )
+            ),
+        
+            -- after: union(null, Value)
+            after Nullable(
+                Tuple(
+                    id UInt32,
+                    name String,
+                    parent_id UInt32,
+                    updated_at DateTime,
+                )
+            ),
+        
+            -- source: record Source
+            source Tuple(
+                        version      String,
+                        connector    String,
+                        name         String,
+                        ts_ms        Int64,
+                        snapshot     Nullable(String),
+                        db           String,
+                        sequence     Nullable(String),
+                        ts_us        Nullable(Int64),
+                        ts_ns        Nullable(Int64),
+                        schema       String,
+                        "table"      String,
+                        txId         Nullable(Int64),
+                        lsn          Nullable(Int64),
+                        xmin         Nullable(Int64),
+                        origin       Nullable(String),
+                        origin_lsn   Nullable(Int64)
+                    ),
+        
+            op    String,
+            ts_ms Nullable(Int64)
+        )
+        ENGINE = Kafka
+        SETTINGS
+            kafka_broker_list = 'kafka:9092',
+            kafka_topic_list = 'petpipeline.public.categories',
+            kafka_group_name = 'clickhouse_debezium_consumer_categories_group_for_petpipeline',
+            kafka_format = 'AvroConfluent',
+            format_avro_schema_registry_url = 'http://schema-registry:8081',
+            kafka_max_block_size = 100000,
+            stream_flush_interval_ms = 5000,
+            kafka_num_consumers = 1,
+            kafka_commit_every_batch = 1;""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_table_captured_changes_products_for_mat_view = ClickHouseOperator(
+        task_id='create_table_captured_changes_products_for_mat_view',
+        sql="""CREATE TABLE IF NOT EXISTS full_pet_pipeline.create_table_captured_changes_products_for_mat_view 
+            (
+            
+            before Nullable(
+                Tuple(
+                    id UInt32,
+                    name String,
+                    price Float32,
+                    category_id LowCardinality(String),
+                    updated_at DateTime
+                )
+            ),
+        
+            -- after: union(null, Value)
+            after Nullable(
+                Tuple(
+                    id UInt32,
+                    name String,
+                    price Float32,
+                    category_id LowCardinality(String),
+                    updated_at DateTime
+                )
+            ),
+            
+                -- source: record Source
+                source Tuple(
+                            version      String,
+                            connector    String,
+                            name         String,
+                            ts_ms        Int64,
+                            snapshot     Nullable(String),
+                            db           String,
+                            sequence     Nullable(String),
+                            ts_us        Nullable(Int64),
+                            ts_ns        Nullable(Int64),
+                            schema       String,
+                            "table"      String,
+                            txId         Nullable(Int64),
+                            lsn          Nullable(Int64),
+                            xmin         Nullable(Int64),
+                            origin       Nullable(String),
+                            origin_lsn   Nullable(Int64)
+                        ),
+            
+            
+                op    String,
+                ts_ms Nullable(Int64)
+            )
+            ENGINE = MergeTree
+            ORDER BY ();""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_table_captured_changes_categories_for_mat_view = ClickHouseOperator(
+        task_id='create_table_captured_changes_categories_for_mat_view',
+        sql="""CREATE TABLE IF NOT EXISTS full_pet_pipeline.create_table_captured_changes_categories_for_mat_view
+            (
+                -- before: union(null, record Value)
+                before Nullable(
+                    Tuple(
+                        id UInt32,
+                        name String,
+                        parent_id UInt32,
+                        updated_at DateTime,
+                    )
+                ),
+            
+                -- after: union(null, Value)
+                after Nullable(
+                    Tuple(
+                        id UInt32,
+                        name String,
+                        parent_id UInt32,
+                        updated_at DateTime
+                    )
+                ),
+            
+                -- source: record Source
+                source Tuple(
+                            version      String,
+                            connector    String,
+                            name         String,
+                            ts_ms        Int64,
+                            snapshot     Nullable(String),
+                            db           String,
+                            sequence     Nullable(String),
+                            ts_us        Nullable(Int64),
+                            ts_ns        Nullable(Int64),
+                            schema       String,
+                            "table"      String,
+                            txId         Nullable(Int64),
+                            lsn          Nullable(Int64),
+                            xmin         Nullable(Int64),
+                            origin       Nullable(String),
+                            origin_lsn   Nullable(Int64)
+                        ),
+            
+            
+                op    String,
+                ts_ms Nullable(Int64)
+            )
+            ENGINE = MergeTree
+            ORDER BY ();""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+
+
+    create_mat_view_capture_changes_products = ClickHouseOperator(
+        task_id='create_mat_view_capture_changes_products',
+        sql="""CREATE MATERIALIZED VIEW IF NOT EXISTS full_pet_pipeline.create_mat_view_capture_changes_products 
+                TO full_pet_pipeline.create_table_captured_changes_products_for_mat_view
+                AS SELECT *
+                FROM full_pet_pipeline.clickhouse_consumer_products;""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_mat_view_capture_changes_categories = ClickHouseOperator(
+        task_id='create_mat_view_capture_changes_categories',
+        sql="""CREATE MATERIALIZED VIEW IF NOT EXISTS full_pet_pipeline.capture_changes_for_fact_sales
+                TO full_pet_pipeline.create_table_captured_changes_categories_for_mat_view
+                AS SELECT *
+                FROM full_pet_pipeline.clickhouse_consumer_categories;""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_mat_view_from_table_captured_changes_products_to_products = ClickHouseOperator(
+        task_id='create_mat_view_from_table_captured_changes_products_to_products',
+        sql="""CREATE MATERIALIZED VIEW IF NOT EXISTS full_pet_pipeline.create_mat_view_from_table_captured_changes_products_to_products
+               TO full_pet_pipeline.products
+               AS SELECT
+                   multiIf(op == 'd', `before.id`, `after.id`) AS id,
+                    multiIf(op == 'd',`before.name`, `after.name`) AS name,
+                    multiIf(op == 'd', `before.price`, `after.price`) AS price,
+                    multiIf(op == 'd', `before.category_id`, `after.category_id`) AS category_id,
+                    multiIf(op == 'd', `before.updated_at`, `after.updated_at`) AS updated_at,
+                   multiIf(op == 'd',0,1) as is_active                  
+               FROM full_pet_pipeline.create_table_captured_changes_products_for_mat_view;""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+    create_mat_view_from_table_captured_changes_categories_to_categories = ClickHouseOperator(
+        task_id='create_mat_view_from_table_captured_changes_categories_to_categories',
+        sql="""CREATE MATERIALIZED VIEW IF NOT EXISTS full_pet_pipeline.create_mat_view_from_table_captured_changes_categories_to_categories
+               TO full_pet_pipeline.categories
+               AS SELECT
+                   multiIf(op == 'd', `before.id`, `after.id`) AS id,
+                    multiIf(op == 'd',`before.name`, `after.name`) AS name,
+                    multiIf(op == 'd', `before.parent_id`, `after.parent_id`) AS parent_id,
+                    multiIf(op == 'd', `before.updated_at`, `after.updated_at`) AS updated_at,
+                   multiIf(op == 'd',0,1) as is_active
+               FROM full_pet_pipeline.create_table_captured_changes_categories_for_mat_view;""",
+        clickhouse_conn_id='clickhouse_default'
+    )
+
+create_clickhouse_consumer_products >> create_mat_view_capture_changes_products
+create_clickhouse_consumer_categories >> create_mat_view_capture_changes_categories
+create_table_captured_changes_products_for_mat_view >> create_mat_view_from_table_captured_changes_products_to_products
+create_table_captured_changes_categories_for_mat_view >> create_mat_view_from_table_captured_changes_categories_to_categories  
