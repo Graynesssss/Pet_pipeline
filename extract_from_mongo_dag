@@ -1,7 +1,7 @@
 from airflow.sdk import DAG,task
 from airflow.providers.telegram.hooks.telegram import TelegramHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.hooks.trigger_dagrun import TriggerDagRunHook
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 def on_failure_callback(context):
 
@@ -42,7 +42,7 @@ default_args={'on_success_callback': on_success_callback
 with DAG(
     'extract_from_mongo_dag',
     schedule=None,
-    default_args,
+    default_args=default_args,
     max_active_runs=1,
     catchup = False,
     tags=['mongo_TIRED']
@@ -119,12 +119,16 @@ with DAG(
         "date_of_create_raw_events_parquet": date_of_create_raw_events_parquet
         }
 
-        trigger_hook = TriggerDagRunHook()
+        return conf
 
-        trigger_hook.trigger_dag(dag_id='transform_data_dag',
-                                logical_date = None,  # В Airflow 2.x называется execution_date
-                                run_id = None,
-                                conf = conf,
-                                wait_for_completion = False,
-                                poke_interval = 60
-                                )
+    extract_raw_evets_from_mongo = extract_raw_evets_from_mongo()
+
+    trigger_transform_task = TriggerDagRunOperator(task_id='trigger_transform_task',
+                                                   trigger_dag_id='transform_data_dag',
+                                                    conf = extract_raw_evets_from_mongo,
+                                                    wait_for_completion = False,
+                                                    )
+
+
+
+extract_raw_evets_from_mongo >> trigger_transform_task
