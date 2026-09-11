@@ -1,10 +1,10 @@
 from airflow.sdk import DAG,task
-from airflow.sdk import Variable # ПРАВИЛЬНЫЙ ИМПОРТ ДЛЯ AIRFLOW 3.x
+from airflow.sdk import Variable 
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.telegram.hooks.telegram import TelegramHook
-from airflow.hooks.trigger_dagrun import TriggerDagRunHook
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 #from airflow.providers.amazon.aws.sensors.s3 import S3KeySizeSensor
 
 import os
@@ -51,56 +51,78 @@ default_args={'on_success_callback': on_success_callback
 # max_source_ts_ms_products = 0 # Время когда произошло какое-то событие(r,c,d,u)
 # max_source_ts_ms_categories = 0 # Время когда произошло какое-то событие(r,c,d,u)
 
+def move():
+
+    source_path="/opt/airflow/dags/create_table_dag.py",
+    archive_dir="/opt/airflow/archive_dags/" 
+
+    if not os.path.exists(archive_dir):
+        os.makedirs(archive_dir)
+        print(f"Создана папка для архива: {archive_dir}")
+
+    # Проверяем, на месте ли исходный файл DAG
+    if os.path.exists(source_path):
+        filename = os.path.basename(source_path) # извлекает create_table_dag.py из source_path
+        destination_path = os.path.join(archive_dir, filename)
+        
+        print(f"Перемещаем файл из {source_path} в {destination_path}...")
+        
+        # Перемещаем файл
+        shutil.move(source_path, destination_path)
+        print("Файл успешно перемещен. Через полминуты DAG исчезнет из UI Airflow.")
+    else:
+        print(f"Ошибка: Файл {source_path} не найден на этом воркере.")
+
+def check_create_table_dag_status():
+
+    import json
+
+    status = json.loads( Variable.get('create_table_dag_status') )
+    
+    if not status:
+        
+        Variable.set('create_table_dag_status', 'true')
+
+        return False
+    
+    return True
+
 with DAG(
     'transform_data_dag',
     schedule=None,
-    default_args,
+    default_args=default_args,
     max_active_runs=1,
     catchup = False,
     tags=['taransform_TIRED']
 
 ) as dag:
+ 
 
-    import json
+    @task.branch
+    def check():
 
-    @task
-    def check_create_table_dag():
+        attempt = False
 
-        status = json.loads( Variable.get('create_table_dag_status') )
+        status = check_create_table_dag_status()
 
         if not status:
+            return 'trigger_create_task'
 
-            trigger_hook = TriggerDagRunHook()
-            
-            trigger_hook.trigger_dag(dag_id='create_table_dag',
-                                    logical_date = None,  # В Airflow 2.x называется execution_date
-                                    run_id = None,
-                                    wait_for_completion = True,
-                                    poke_interval = 15
-                                    )
-            
-            Variable.set('create_table_dag_status', 'true')
+        if not attempt:
+            move()
 
-            source_path="/opt/airflow/dags/create_table_dag.py",
-            archive_dir="/opt/airflow/archive_dags/" 
+        attempt = True
+        return 'skip_products_and_categories'
 
-            if not os.path.exists(archive_dir):
-                os.makedirs(archive_dir)
-                print(f"Создана папка для архива: {archive_dir}")
-    
-            # Проверяем, на месте ли исходный файл DAG
-            if os.path.exists(source_path):
-                filename = os.path.basename(source_path) # извлекает create_table_dag.py из source_path
-                destination_path = os.path.join(archive_dir, filename)
-                
-                print(f"Перемещаем файл из {source_path} в {destination_path}...")
-                
-                # Перемещаем файл
-                shutil.move(source_path, destination_path)
-                print("Файл успешно перемещен. Через полминуты DAG исчезнет из UI Airflow.")
-            else:
-                print(f"Ошибка: Файл {source_path} не найден на этом воркере.")
-    
+
+
+
+    trigger_create_task = TriggerDagRunOperator(task_id='trigger_create_task',
+                                                trigger_dag_id='create_table_dag',
+                                                wait_for_completion = True,
+                                                poke_interval = 15
+                                                )
+
 
     @task
     def change_s3_file_products(path_to_products):
@@ -238,6 +260,9 @@ with DAG(
 
         if os.path.exists(local_path_categories):
             os.remove(local_path_categories)
+
+
+    skip_products_and_categories = EmptyOperator(task_id='skip_products_and_categories')
 
 
     @task.branch
@@ -495,29 +520,38 @@ with DAG(
                         SELECT * FROM s3_fact_sales
                         WHERE _path = http://airflow-docker-minio-1:9000/fullpetpipeline/events/date=%(date_of_create_fact_sales_parquet)s/fact_sales.parquet
                          """,{"date_of_create_fact_sales_parquet": date_of_create_fact_sales_parquet})
+        
 
-check_create_table_dag = check_create_table_dag()
-choice_extract_from_postgres_or_change_s3_file_products_or_categories = choice_extract_from_postgres_or_change_s3_file_products_or_categories()
-postgres = extract_from_postgres()
-refresh_last_timestamp_and_product_cache = refresh_last_timestamp_and_product_cache()
-upload_raw_events_to_clickhouse_in_raw_events = upload_raw_events_to_clickhouse_in_raw_events()
+    check = check()
 
-date_of_create_fact_sales_parquet = extract_raw_events_from_clickhouse_for_transform()
-path_to_products,path_to_categories = postgres['key_path_products'],postgres['key_path_categories']
+    choice_extract_from_postgres_or_change_s3_file_products_or_categories = choice_extract_from_postgres_or_change_s3_file_products_or_categories()
+    change_s3_file_products = change_s3_file_products("events/products.parquet")
+    change_s3_file_categories = change_s3_file_categories("events/categories.parquet")
 
-refresh_last_timestamp_and_product_cache(path_to_products,path_to_categories)
-upload_transform_data_to_clickhouse_in_fact_sales(date_of_create_fact_sales_parquet=date_of_create_fact_sales_parquet)
-extract_raw_events_from_clickhouse_for_transform = extract_raw_events_from_clickhouse_for_transform(last_time_stamp)
-
-check_create_table_dag >> [choice_extract_from_postgres_or_change_s3_file_products_or_categories
-                           ,extract_from_postgres
-                           ,upload_raw_events_to_clickhouse_in_raw_event]
-
-choice_extract_from_postgres_or_change_s3_file_products_or_categories >> [postgres
-                                                                          ,change_s3_file_products
-                                                                          ,change_s3_file_categories]
+    postgres = extract_from_postgres()
+    upload_raw_events_to_clickhouse_in_raw_events = upload_raw_events_to_clickhouse_in_raw_events()
+    upload_categories_to_clickhouse = upload_categories_to_clickhouse()
+    upload_products_to_clickhouse = upload_products_to_clickhouse()
 
 
-postgres >> [upload_categories_to_clickhouse, upload_products_to_clickhouse]
+    path_to_products,path_to_categories = postgres['key_path_products'],postgres['key_path_categories']
 
-upload_raw_events_to_clickhouse_in_raw_events >> extract_raw_events_from_clickhouse_for_transform
+    last_time_stamp = refresh_last_timestamp_and_product_cache(path_to_products,path_to_categories)
+
+    date_of_create_fact_sales_parquet = extract_raw_events_from_clickhouse_for_transform(last_time_stamp=last_time_stamp)
+    upload_transform_data_to_clickhouse_in_fact_sales = upload_transform_data_to_clickhouse_in_fact_sales(date_of_create_fact_sales_parquet=date_of_create_fact_sales_parquet)
+
+    check >> trigger_create_task
+
+    trigger_create_task >> [choice_extract_from_postgres_or_change_s3_file_products_or_categories
+                            ,postgres
+                            ,upload_raw_events_to_clickhouse_in_raw_events]
+
+    choice_extract_from_postgres_or_change_s3_file_products_or_categories >> [postgres
+                                                                            ,change_s3_file_products
+                                                                            ,change_s3_file_categories]
+
+
+    postgres >> [upload_categories_to_clickhouse, upload_products_to_clickhouse]
+
+    upload_raw_events_to_clickhouse_in_raw_events >> date_of_create_fact_sales_parquet
